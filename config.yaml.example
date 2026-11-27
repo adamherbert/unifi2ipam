@@ -8,6 +8,14 @@ unifi:
   # Recommended: use the UNIFI_API_KEY environment variable instead.
   # api_key: "your_unifi_api_key_here"
 
+  # Classic API base (alias + Local DNS Record live only there). Derived from url if omitted.
+  # legacy_url: "https://unifi.local/proxy/network/"
+  # site_name: "default"
+
+dns:
+  # Zone of the Default network; Local DNS Records in it are stored without it.
+  # zone: "home.8none1.com"
+
 ipam:
   # Base URL of your phpIPAM instance (no trailing slash).
   base_url: "https://ipam.local"

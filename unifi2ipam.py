@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
 
 # Synchronize network client information from a UniFi Network Controller to a phpIPAM instance.
-
-# This script can operate in two modes:
-# 1. Sync Mode (default): Updates phpIPAM based on MAC addresses. If a device is found,
-#     it's updated. If not, it's created.
-# 2. Nuke and Pave Mode (--nuke-and-pave): Deletes all addresses in all configured
-#     subnets in phpIPAM and then creates fresh records for every client found in UniFi.
+#
+# phpIPAM is meant to feed DNS, so this tool writes only what a DNS consumer can trust:
+#   - hostname   the curated DNS name (UniFi "Local DNS Record", else a valid alias), stored as the
+#                part before the configured zone ("pet-cam.iot"), or EMPTY when the client has no
+#                forward name (no curated name, a randomised MAC, or a duplicate name).
+#   - description the human-readable UniFi display name (so the inventory value is kept).
+#   - owner      "unifi2ipam" on every row this tool creates. It never updates or deletes a row
+#                it did not create.
+#   - lastSeen   set to the time of the run for every client that is connected.
+# Nothing is ever written if UniFi cannot be read. --dryrun reads everything and writes nothing.
 
 import argparse
 import ipaddress
 import json
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 import urllib3
 import yaml
 
+__version__ = "1.2.0"
 DEFAULT_CONFIG_PATH = Path("/etc/unifi2ipam/config.yaml")
 
 
@@ -33,6 +40,12 @@ class Config:
     verify_ssl: bool
     include_subnets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = field(default_factory=list)
     exclude_subnets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = field(default_factory=list)
+    # The legacy (non-integration) UniFi API is the only one that exposes a client's alias and
+    # Local DNS Record. Derived from unifi_url when not given.
+    unifi_legacy_url: str = ""
+    unifi_site_name: str = "default"
+    dns_zone: str = ""
+    dry_run: bool = False
 
 
 def setup_logging(args) -> None:
@@ -108,6 +121,9 @@ def load_config(args) -> Config:
         "ipam_app_id": None,
         "ipam_key": None,
         "insecure": False,
+        "unifi_legacy_url": None,
+        "unifi_site_name": None,
+        "dns_zone": None,
         "include_subnets": [],
         "exclude_subnets": [],
     }
@@ -127,6 +143,9 @@ def load_config(args) -> Config:
         values["ipam_base_url"] = ipam_cfg.get("base_url")
         values["ipam_app_id"] = ipam_cfg.get("app_id")
         values["ipam_key"] = ipam_cfg.get("api_key")
+        values["unifi_legacy_url"] = unifi_cfg.get("legacy_url")
+        values["unifi_site_name"] = unifi_cfg.get("site_name")
+        values["dns_zone"] = (file_cfg.get("dns") or {}).get("zone")
         values["insecure"] = file_cfg.get("insecure", False)
         values["include_subnets"] = file_cfg.get("subnets", {}).get("include", [])
         values["exclude_subnets"] = file_cfg.get("subnets", {}).get("exclude", [])
@@ -142,6 +161,9 @@ def load_config(args) -> Config:
         "IPAM_BASE_URL": "ipam_base_url",
         "IPAM_APP_ID": "ipam_app_id",
         "IPAM_API_KEY": "ipam_key",
+        "UNIFI_LEGACY_URL": "unifi_legacy_url",
+        "UNIFI_SITE_NAME": "unifi_site_name",
+        "DNS_ZONE": "dns_zone",
     }
     for env_var, key in env_map.items():
         val = os.environ.get(env_var)
@@ -155,6 +177,10 @@ def load_config(args) -> Config:
         values["ipam_base_url"] = args.ipam_base_url
     if args.ipam_app_id:
         values["ipam_app_id"] = args.ipam_app_id
+    if args.unifi_site_name:
+        values["unifi_site_name"] = args.unifi_site_name
+    if args.dns_zone:
+        values["dns_zone"] = args.dns_zone
     if args.insecure:
         values["insecure"] = True
     if args.include_subnet:
@@ -173,6 +199,11 @@ def load_config(args) -> Config:
         logging.error("--include-subnet and --exclude-subnet (subnets.include / subnets.exclude) are mutually exclusive.")
         raise SystemExit(1)
 
+    # The legacy API lives next to the integration API: .../proxy/network/integration/v1/ -> .../proxy/network/
+    legacy_url = values["unifi_legacy_url"]
+    if not legacy_url and values["unifi_url"] and "/integration/" in values["unifi_url"]:
+        legacy_url = values["unifi_url"].split("/integration/")[0] + "/"
+
     # Pre-flight validation — all four required fields must be present.
     missing = []
     if not values["unifi_url"]:
@@ -185,6 +216,9 @@ def load_config(args) -> Config:
         missing.append("phpIPAM App ID  (--ipam-app-id, IPAM_APP_ID env var, or config file ipam.app_id)")
     if not values["ipam_key"]:
         missing.append("phpIPAM API key  (IPAM_API_KEY env var or config file ipam.api_key)")
+
+    if not legacy_url:
+        missing.append("UniFi legacy URL  (UNIFI_LEGACY_URL, or a unifi.url containing /integration/ to derive it from)")
 
     if missing:
         logging.error("Missing required configuration:")
@@ -213,7 +247,29 @@ def load_config(args) -> Config:
         verify_ssl=not values["insecure"],
         include_subnets=include_subnets,
         exclude_subnets=exclude_subnets,
+        unifi_legacy_url=legacy_url,
+        unifi_site_name=values["unifi_site_name"] or "default",
+        dns_zone=(values["dns_zone"] or "").strip().strip(".").lower(),
+        dry_run=bool(args.dryrun),
     )
+
+
+OWNER = "unifi2ipam"
+# v1.0.x wrote this note on every row it created and nothing else marked them. Rows carrying it
+# are adopted as ours; a row without it (hand-made, Terraform, other tools) is foreign.
+LEGACY_NOTE = "Created by UniFi2IPAM"
+DESC_MAX = 60  # phpIPAM's description column is short; longer values fail with SQLSTATE 22001
+
+_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+_MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+
+class IpamError(Exception):
+    """phpIPAM did not give a usable answer. Never read as 'not found'."""
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def xmit(cfg: Config, service, endpoint, params=None, method="get") -> dict:
@@ -222,23 +278,34 @@ def xmit(cfg: Config, service, endpoint, params=None, method="get") -> dict:
 
     Args:
         cfg (Config): The active configuration object.
-        service (str): The target service, either 'unifi' or 'ipam'.
+        service (str): 'unifi' (integration API), 'unifi_legacy' (classic API) or 'ipam'.
         endpoint (str): The specific API endpoint to target (e.g., 'sites').
-        params (dict, optional): A dictionary of parameters. Used as query params for GET
-            or as the JSON body for POST/PATCH. Defaults to None.
+        params (dict, optional): Query params for GET, JSON body for POST/PATCH.
         method (str, optional): The HTTP method to use. Defaults to "get".
 
     Returns:
         dict: The JSON response from the API as a dictionary, or {} on failure.
+
+    UniFi is read-only here, and in dry-run mode nothing that is not a GET leaves this function.
     """
     if service == "unifi":
         headers = {"X-API-Key": cfg.unifi_key, "Content-Type": "application/json"}
         base_url = cfg.unifi_url
+    elif service == "unifi_legacy":
+        headers = {"X-API-Key": cfg.unifi_key, "Content-Type": "application/json"}
+        base_url = cfg.unifi_legacy_url
     elif service == "ipam":
         headers = {"token": cfg.ipam_key, "Content-Type": "application/json"}
         base_url = cfg.ipam_url
     else:
-        raise ValueError("Invalid service specified. Use 'unifi' or 'ipam'")
+        raise ValueError("Invalid service specified. Use 'unifi', 'unifi_legacy' or 'ipam'")
+
+    if service != "ipam" and method.lower() != "get":
+        raise ValueError("UniFi is read-only: refusing a non-GET request")
+
+    if cfg.dry_run and method.lower() != "get":
+        logging.info(f"[dry-run] would {method.upper()} {endpoint} {json.dumps(params) if params else ''}".rstrip())
+        return {"success": True, "dry_run": True}
 
     try:
         requests_method = getattr(requests, method.lower())
@@ -275,171 +342,252 @@ def xmit(cfg: Config, service, endpoint, params=None, method="get") -> dict:
             logging.error(f"HTTP error: {errh}")
     except AttributeError:
         logging.error(f"Invalid or unsupported HTTP method '{method}'")
-    except requests.exceptions.RequestException as err:
+    except (requests.exceptions.RequestException, ValueError) as err:
         logging.error(f"Request failed: {err}")
 
     return {}
 
 
-def nuke_ipam_addresses(cfg: Config) -> bool:
-    """
-    Deletes all existing address records from all subnets found in phpIPAM.
-    This is a destructive operation used for the --nuke-and-pave mode.
+# ---------------------------------------------------------------------------
+# Names
+# ---------------------------------------------------------------------------
 
-    Returns:
-        bool: True if the operation was successful, False otherwise.
-    """
-    logging.info("--- STARTING NUKE PHASE ---")
+def normalize_mac(mac: str) -> str:
+    return mac.strip().lower().replace("-", ":")
 
-    subnets = xmit(cfg, "ipam", "subnets")
 
-    if not subnets.get("success"):
-        logging.error("Unable to retrieve subnets from phpIPAM. Nuke operation aborted.")
+def is_randomised_mac(mac: str) -> bool:
+    """True for a locally administered MAC (bit 0x02 of the first octet): iOS/Android/Windows privacy addresses."""
+    try:
+        return bool(int(normalize_mac(mac).split(":")[0], 16) & 0x02)
+    except (ValueError, IndexError):
         return False
 
-    for subnet in subnets["data"]:
-        subnet_id = subnet["id"]
-        logging.info(f"Truncating subnet {subnet_id} ({subnet['subnet']})")
-        nuke = xmit(cfg, "ipam", f"subnets/{subnet_id}/truncate/", method="delete")
-        if nuke and nuke.get("success"):
-            logging.info(f"Subnet {subnet_id} cleared.")
-        else:
-            logging.error(f"Failed to clear subnet {subnet_id}. Response: {nuke}")
 
-    return True
-
-
-def create_new_address(cfg: Config, ip, mac, hostname, payload=None) -> bool:
+def dns_name_from_local_record(record: str, zone: str) -> str | None:
     """
-    Creates a new address record in phpIPAM. It first finds the most
-    specific containing subnet for the given IP address.
-
-    Args:
-        cfg (Config): The active configuration object.
-        ip (str): The IP address for the new record.
-        mac (str): The MAC address for the new record.
-        hostname (str): The hostname for the new record.
-        payload (dict, optional): Existing record fields to preserve on re-create.
-
-    Returns:
-        bool: True if the address was successfully created, False otherwise.
+    'pet-cam.iot.home.8none1.com' -> 'pet-cam.iot' for zone 'home.8none1.com'.
+    None if the record is not in the zone, is the zone apex, has more than two labels left of the
+    zone, or any label is not a valid lowercase DNS label.
     """
-    subnet_response = xmit(cfg, "ipam", f"subnets/overlapping/{ip}/32")
-    if not subnet_response or not subnet_response.get("data"):
-        logging.error(f"No containing subnet found for {ip}. Cannot create address.")
-        return False
+    if not zone:
+        return None
+    rec = record.strip().rstrip(".").lower()
+    suffix = "." + zone
+    if not rec.endswith(suffix):
+        return None
+    labels = rec[: -len(suffix)].split(".")
+    if not 1 <= len(labels) <= 2 or not all(_LABEL_RE.match(label) for label in labels):
+        return None
+    return ".".join(labels)
 
-    subnet_id = subnet_response["data"][0]["id"]
 
-    if payload:
-        create_payload = {
-            "ip": ip,
-            "subnetId": subnet_id,
-            "mac": mac,
-            "note": f"{payload.get('note', '')} Updated by UniFi2IPAM".strip(),
-        }
-        # Preserve custom fields from the existing record, excluding system-managed ones.
-        for key, value in payload.items():
-            if key not in {"id", "subnetId", "ip", "mac", "location", "note",
-                           "firewallAddressObject", "editDate", "customer_id"}:
-                create_payload[key] = value
-    else:
-        create_payload = {
-            "ip": ip,
-            "subnetId": subnet_id,
-            "hostname": hostname,
-            "mac": mac,
-            "note": "Created by UniFi2IPAM",
-            "description": "",
-        }
+def dns_name_from_alias(alias: str) -> str | None:
+    """
+    An alias is a curated name only if it is already a single valid label ('k3s-server-01',
+    'Bambu-P1S'). 'Living Room TV', "Adam's iPhone" or 'SonosZP 16:0c' are display names, not DNS
+    names, and are never repaired into one.
+    """
+    a = alias.strip().lower()
+    if a in ("", "unknown") or not _LABEL_RE.match(a):
+        return None
+    return a
 
-    create_response = xmit(cfg, "ipam", "addresses", params=create_payload, method="post")
 
-    if create_response and create_response.get("success"):
-        logging.info(f"Created address {ip} (MAC {mac})")
+def curated_name(cfg: Config, mac: str, user: dict | None) -> tuple[str | None, str]:
+    """Return (dns_name or None, reason). The reason is for the log and the dry-run plan."""
+    if is_randomised_mac(mac):
+        return None, "randomised MAC"
+    if not user:
+        return None, "no UniFi client record"
+    record = (user.get("local_dns_record") or "").strip()
+    if record and user.get("local_dns_record_enabled", True):
+        name = dns_name_from_local_record(record, cfg.dns_zone)
+        if name:
+            return name, "local DNS record"
+        return None, "local DNS record not usable (outside zone or not valid labels)"
+    alias = (user.get("name") or "").strip()
+    if alias:
+        name = dns_name_from_alias(alias)
+        if name:
+            return name, "alias"
+        return None, "alias is not a valid DNS name"
+    return None, "no curated name"
+
+
+def build_desired(cfg: Config, client: dict, user: dict | None) -> dict:
+    mac = normalize_mac(client["macAddress"])
+    name, reason = curated_name(cfg, mac, user)
+    display = (client.get("name") or "").strip() or mac
+    return {
+        "ip": client["ipAddress"],
+        "mac": mac,
+        "hostname": name or "",
+        "reason": reason,
+        "description": display[:DESC_MAX],
+        "owner": OWNER,
+        "note": LEGACY_NOTE,
+    }
+
+
+def enforce_unique_names(plans: list[dict]) -> None:
+    """A name two connected clients both claim is not a curated unique name: neither gets it."""
+    seen: dict[str, list[dict]] = {}
+    for p in plans:
+        if p["hostname"]:
+            seen.setdefault(p["hostname"], []).append(p)
+    for name, group in seen.items():
+        if len(group) > 1:
+            logging.warning(f"Name '{name}' claimed by {[p['mac'] for p in group]} — none of them gets a forward name")
+            for p in group:
+                p["hostname"] = ""
+                p["reason"] = "duplicate name"
+
+
+# ---------------------------------------------------------------------------
+# phpIPAM
+# ---------------------------------------------------------------------------
+
+def is_owned(row: dict) -> bool:
+    return row.get("owner") == OWNER or (row.get("note") or "").startswith(LEGACY_NOTE)
+
+
+def ipam_lookup(cfg: Config, endpoint: str) -> list:
+    """
+    GET a phpIPAM collection. 404 ('nothing found') is []. Anything else that is not a success
+    (no response, 5xx, 401, malformed) raises IpamError: an unknown must not read as 'not found'.
+    """
+    resp = xmit(cfg, "ipam", endpoint)
+    if not resp:
+        raise IpamError(f"no response from phpIPAM for {endpoint}")
+    if resp.get("success"):
+        data = resp.get("data") or []
+        return [data] if isinstance(data, dict) else list(data)
+    if resp.get("code") == 404:
+        return []
+    raise IpamError(f"phpIPAM answered {resp.get('code')} {resp.get('message')} for {endpoint}")
+
+
+def ipam_write(cfg: Config, endpoint: str, params, method: str) -> bool:
+    resp = xmit(cfg, "ipam", endpoint, params=params, method=method)
+    if resp and resp.get("success"):
         return True
-
-    # If phpIPAM reported a conflict, find and remove the stale record then retry.
-    # This handles devices that changed MAC but kept the same IP.
-    if "already exists" in (create_response.get("message") or "").lower():
-        existing = xmit(cfg, "ipam", f"addresses/search/{ip}/")
-        if existing and existing.get("data"):
-            conflict_id = existing["data"][0]["id"]
-            conflict_mac = existing["data"][0].get("mac", "unknown")
-            logging.warning(
-                f"IP {ip} already exists (record {conflict_id}, MAC {conflict_mac}) — "
-                f"removing stale record and retrying"
-            )
-            remove = xmit(cfg, "ipam", f"addresses/{conflict_id}/", method="delete")
-            if remove and remove.get("success"):
-                create_response = xmit(cfg, "ipam", "addresses", params=create_payload, method="post")
-                if create_response and create_response.get("success"):
-                    logging.info(f"Created address {ip} (MAC {mac}) after resolving conflict")
-                    return True
-            else:
-                logging.error(f"Failed to remove stale record {conflict_id} for IP {ip}")
-
-    msg = create_response.get("message") if create_response else "No response"
-    logging.error(f"Failed to create address {ip} (MAC {mac}): {msg}")
+    logging.error(f"phpIPAM {method.upper()} {endpoint} failed: {(resp or {}).get('message', 'no response')}")
     return False
 
 
-def sync_phpipam_by_mac(cfg: Config, ip, mac, hostname) -> None:
+def same_ip(a: str, b: str) -> bool:
+    try:
+        return ipaddress.ip_address(a) == ipaddress.ip_address(b)
+    except ValueError:
+        return a == b
+
+
+def lookup_subnet_id(cfg: Config, ip: str):
+    subnets = ipam_lookup(cfg, f"subnets/overlapping/{ip}/32")
+    if not subnets:
+        return None
+    # Most specific containing subnet.
+    return max(subnets, key=lambda s: int(s.get("mask") or 0))["id"]
+
+
+def row_changes(row: dict, desired: dict, last_seen: str) -> dict:
+    """Fields to PATCH: whatever differs, plus lastSeen (always: the client is connected)."""
+    changes = {}
+    for key in ("hostname", "description", "mac", "owner", "note"):
+        if (row.get(key) or "") != desired[key]:
+            changes[key] = desired[key]
+    changes["lastSeen"] = last_seen
+    return changes
+
+
+def delete_owned(cfg: Config, row: dict) -> bool:
+    """The only delete in this tool. Refuses any row that is not ours."""
+    if not is_owned(row):
+        logging.error(f"Refusing to delete row {row.get('id')}: not created by unifi2ipam")
+        return False
+    return ipam_write(cfg, f"addresses/{row['id']}/", None, "delete")
+
+
+def create_row(cfg: Config, desired: dict, last_seen: str) -> bool:
+    subnet_id = lookup_subnet_id(cfg, desired["ip"])
+    if subnet_id is None:
+        logging.error(f"No containing subnet found for {desired['ip']}. Cannot create address.")
+        return False
+    payload = {
+        "ip": desired["ip"],
+        "subnetId": subnet_id,
+        "mac": desired["mac"],
+        "description": desired["description"],
+        "owner": OWNER,
+        "note": LEGACY_NOTE,
+        "lastSeen": last_seen,
+    }
+    if desired["hostname"]:
+        payload["hostname"] = desired["hostname"]
+    return ipam_write(cfg, "addresses", payload, "post")
+
+
+def sync_client(cfg: Config, desired: dict, last_seen: str) -> str:
     """
-    Finds a device by its MAC address in phpIPAM and updates its IP and hostname.
-    If not found, creates a new address record.
+    Reconcile one connected client. Returns the outcome: created, updated, moved, takeover,
+    foreign (address held by a row we do not own: left alone), or error.
 
-    The IP update is handled as create-then-delete: the new record is created first,
-    and the old one is only removed after the new one is confirmed. This avoids a
-    window where no record exists if the create step fails.
-
-    Args:
-        cfg (Config): The active configuration object.
-        ip (str): The current IP address of the device from UniFi.
-        mac (str): The MAC address of the device, used as the primary key.
-        hostname (str): The current hostname of the device from UniFi.
+    Rules: a row we did not create is never updated or deleted, whatever MAC or address it holds.
     """
-    response = xmit(cfg, "ipam", f"addresses/search_mac/{mac}/")
+    ip, mac = desired["ip"], desired["mac"]
+    try:
+        by_mac = [r for r in ipam_lookup(cfg, f"addresses/search_mac/{mac}/") if is_owned(r)]
+        at_ip = [r for r in ipam_lookup(cfg, f"addresses/search/{ip}/") if same_ip(r.get("ip", ""), ip)]
+    except IpamError as e:
+        logging.error(f"{mac} ({ip}): {e}")
+        return "error"
 
-    if not response or not response.get("data"):
-        logging.info(f"MAC {mac} not found in phpIPAM — creating new entry")
-        create_new_address(cfg, ip, mac, hostname)
-        return
-
-    existing_record = response["data"][0]
-    record_id = existing_record["id"]
-    existing_ip = existing_record["ip"]
-
-    if existing_ip == ip:
-        logging.info(f"MAC {mac} already has correct IP {ip} — no update needed")
-        return
-
-    logging.info(f"MAC {mac} (record {record_id}): IP changed {existing_ip} → {ip}")
-
-    # Create the new record first; only delete the old one if that succeeds.
-    success = create_new_address(cfg, ip, mac, hostname, payload=existing_record)
-    if success:
-        remove = xmit(cfg, "ipam", f"addresses/{record_id}/", method="delete")
-        if not remove or not remove.get("success"):
-            logging.warning(
-                f"New record created for {mac} but failed to delete old record {record_id}"
-            )
-    else:
-        logging.error(
-            f"Failed to create new record for {mac}; old record {record_id} preserved"
+    foreign = [r for r in at_ip if not is_owned(r)]
+    if foreign:
+        logging.warning(
+            f"{mac} ({ip}): address held by row {foreign[0].get('id')} ({foreign[0].get('hostname')!r}) "
+            f"which unifi2ipam did not create — left alone"
         )
+        return "foreign"
 
+    mine_here = [r for r in at_ip if normalize_mac(r.get("mac") or "") == mac]
+    mine_elsewhere = [r for r in by_mac if not same_ip(r.get("ip", ""), ip)]
+    stale_here = [r for r in at_ip if r not in mine_here]  # ours, but another MAC's row
+
+    if mine_here:
+        row = mine_here[0]
+        ok = ipam_write(cfg, f"addresses/{row['id']}/", row_changes(row, desired, last_seen), "patch")
+        return "updated" if ok else "error"
+
+    if stale_here:
+        # Our own row for a device that left this address: reuse it for the new holder.
+        row = stale_here[0]
+        if not ipam_write(cfg, f"addresses/{row['id']}/", row_changes(row, desired, last_seen), "patch"):
+            return "error"
+        for old in mine_elsewhere:
+            if not delete_owned(cfg, old):
+                return "error"
+        return "takeover"
+
+    # Nothing at this address. phpIPAM cannot change a row's IP, so a move is create-then-delete,
+    # and the old row is removed only after the new one exists.
+    if not create_row(cfg, desired, last_seen):
+        return "error"
+    for old in mine_elsewhere:
+        if not delete_owned(cfg, old):
+            return "error"
+    return "moved" if mine_elsewhere else "created"
+
+
+# ---------------------------------------------------------------------------
+# UniFi
+# ---------------------------------------------------------------------------
 
 def select_site_id(sites) -> str:
     """
     Prompts the user to select a site from the available sites in the UniFi API.
     Exits if no valid choice is made.
-
-    Args:
-        sites (dict): The JSON response from the UniFi API containing site data.
-
-    Returns:
-        str: The ID of the selected site.
     """
     print("===== Available sites =====")
     for i, site in enumerate(sites.get("data", []), start=1):
@@ -458,19 +606,11 @@ def select_site_id(sites) -> str:
 
 def get_unifi_clients(cfg: Config, limit, site_arg=None) -> list:
     """
-    Fetches the list of clients from the UniFi API.
-
-    Args:
-        cfg (Config): The active configuration object.
-        limit (int): Maximum number of clients to fetch.
-        site_arg (str, optional): A specific site ID to use directly.
-
-    Returns:
-        list: A list of client dictionaries from the UniFi API.
+    Fetches the connected clients from the UniFi integration API. Exits 1 on an error or an empty list.
     """
     if site_arg:
         logging.info(f"Using specified site ID: {site_arg}")
-        client_list = xmit(cfg, "unifi", f"sites/{site_arg}/clients", params={"limit": limit})
+        site_id = site_arg
     else:
         logging.info("Fetching sites from UniFi API...")
         sites = xmit(cfg, "unifi", "sites")
@@ -485,117 +625,108 @@ def get_unifi_clients(cfg: Config, limit, site_arg=None) -> list:
             site_id = sites["data"][0]["id"]
             logging.info(f"One site found — using site ID: {site_id}")
 
-        logging.info("Fetching clients from UniFi API...")
-        client_list = xmit(cfg, "unifi", f"sites/{site_id}/clients", params={"limit": limit})
+    logging.info("Fetching clients from UniFi API...")
+    client_list = xmit(cfg, "unifi", f"sites/{site_id}/clients", params={"limit": limit})
 
     if client_list and client_list.get("data"):
+        total = client_list.get("totalCount")
+        if isinstance(total, int) and total > len(client_list["data"]):
+            logging.warning(f"UniFi reports {total} clients but returned {len(client_list['data'])} (raise --limit)")
         return client_list["data"]
 
     logging.error("No clients found or unable to retrieve client data.")
     raise SystemExit(1)
 
 
-def process_client(cfg: Config, nuke_and_pave: bool, client: dict) -> None:
+def get_unifi_user_records(cfg: Config) -> dict:
     """
-    Process a single UniFi client — either pave (create) or sync it in phpIPAM.
-    Designed to be called from a thread pool.
-
-    Args:
-        cfg (Config): The active configuration object.
-        nuke_and_pave (bool): If True, always create a new record (pave mode).
-        client (dict): A single client dict from the UniFi API.
+    The classic API's known-clients list (alias + Local DNS Record), keyed by lower-case MAC.
+    The integration API does not expose either field. Exits 1 on any error or an empty list:
+    without it every curated name would silently fall back to 'none'.
     """
-    if "ipAddress" not in client or "macAddress" not in client:
-        logging.debug(f"Client missing IP or MAC — skipping: {json.dumps(client)}")
-        return
-
-    ip = client["ipAddress"]
-    mac = client["macAddress"]
-    hostname = client.get("name", "Unknown")
-
-    if not is_in_filter(cfg, ip):
-        logging.debug(f"Skipping MAC {mac} (IP: {ip}) — filtered by subnet configuration")
-        return
-
-    if nuke_and_pave:
-        logging.info(f"Paving MAC {mac} (IP: {ip})")
-        create_new_address(cfg, ip, mac, hostname)
-    else:
-        logging.info(f"Syncing MAC {mac} (IP: {ip})")
-        sync_phpipam_by_mac(cfg, ip, mac, hostname)
+    resp = xmit(cfg, "unifi_legacy", f"api/s/{cfg.unifi_site_name}/rest/user")
+    meta_ok = (resp or {}).get("meta", {}).get("rc") == "ok"
+    data = (resp or {}).get("data")
+    if not resp or not meta_ok or not isinstance(data, list) or not data:
+        logging.error("Unable to read client names (alias / Local DNS Record) from UniFi. Nothing written.")
+        raise SystemExit(1)
+    return {normalize_mac(u["mac"]): u for u in data if u.get("mac")}
 
 
-def do_dry_run(cfg: Config, args) -> None:
-    """
-    Fetch UniFi clients and log what would be synced without touching phpIPAM.
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
 
-    Args:
-        cfg (Config): The active configuration object.
-        args: Parsed command-line arguments.
-    """
-    logging.info("Dry run mode — no changes will be made to phpIPAM.")
-
-    if args.nuke_and_pave:
-        logging.warning("--nuke-and-pave is set but has no effect in dry run mode.")
-
-    clients = get_unifi_clients(cfg, args.limit, args.site_id)
-    logging.info(f"Found {len(clients)} clients in UniFi.")
-
+def plan_run(cfg: Config, clients: list, users: dict) -> list:
+    """Pure: UniFi data in, one desired-state dict per in-scope client out."""
+    plans = []
+    seen_ips, seen_macs = set(), set()
     for client in clients:
         if "ipAddress" not in client or "macAddress" not in client:
-            logging.debug(f"Client missing IP or MAC: {json.dumps(client)}")
+            logging.debug(f"Client missing IP or MAC — skipping: {json.dumps(client)}")
             continue
+        if not is_in_filter(cfg, client["ipAddress"]):
+            logging.debug(f"Skipping {client['macAddress']} ({client['ipAddress']}) — filtered by subnet configuration")
+            continue
+        plan = build_desired(cfg, client, users.get(normalize_mac(client["macAddress"])))
+        if plan["ip"] in seen_ips or plan["mac"] in seen_macs:
+            logging.warning(f"Duplicate IP or MAC in UniFi client list ({plan['mac']} {plan['ip']}) — skipped")
+            continue
+        seen_ips.add(plan["ip"])
+        seen_macs.add(plan["mac"])
+        plans.append(plan)
+    enforce_unique_names(plans)
+    return plans
 
-        ip = client["ipAddress"]
-        mac = client["macAddress"]
-        hostname = client.get("name", "Unknown")
 
-        if not is_in_filter(cfg, ip):
-            logging.debug(f"Would skip MAC {mac} (IP: {ip}) — filtered by subnet configuration")
-        else:
-            logging.info(f"Would sync MAC {mac} (IP: {ip}, hostname: {hostname})")
-
-    logging.info("Dry run complete.")
+def process_client(cfg: Config, plan: dict, last_seen: str) -> str:
+    name = plan["hostname"] or "(no forward name)"
+    logging.info(f"Syncing {plan['mac']} ({plan['ip']}) -> {name} [{plan['reason']}]")
+    return sync_client(cfg, plan, last_seen)
 
 
-def main(cfg: Config, args) -> None:
-    """Main execution flow."""
-
+def main(cfg: Config, args) -> int:
+    """Main execution flow. Returns the process exit code."""
     if args.dryrun:
-        do_dry_run(cfg, args)
-        return
+        logging.info("Dry run mode — phpIPAM and UniFi are read, nothing is written.")
 
-    if args.nuke_and_pave:
-        print("====== WARNING! ======")
-        print("Nuke and pave mode will delete ALL existing addresses in ALL subnets in phpIPAM.")
-        check = input("Type 'yes' to confirm: ")
-        if check.lower() != "yes":
-            logging.info("Nuke and pave cancelled.")
-            return
-
-        if not nuke_ipam_addresses(cfg):
-            logging.error("Nuke phase failed. Aborting.")
-            raise SystemExit(1)
-        logging.info("Nuke phase complete.")
-
+    # Everything UniFi says is read first: if it fails, phpIPAM is never touched.
     clients = get_unifi_clients(cfg, args.limit, args.site_id)
-    logging.info(f"Found {len(clients)} clients. Processing with {args.workers} workers...")
+    users = get_unifi_user_records(cfg)
+    plans = plan_run(cfg, clients, users)
+    logging.info(f"Found {len(clients)} clients, {len(plans)} in scope.")
+    if not plans:
+        logging.error("No in-scope clients (check the subnet filter). Nothing written.")
+        return 1
 
+    try:
+        ipam_lookup(cfg, "subnets/")  # phpIPAM must answer before the first write
+    except IpamError as e:
+        logging.error(f"phpIPAM is not usable: {e}. Nothing written.")
+        return 1
+
+    last_seen = utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    outcomes: dict[str, int] = {}
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {
-            executor.submit(process_client, cfg, args.nuke_and_pave, client): client
-            for client in clients
-        }
+        futures = {executor.submit(process_client, cfg, p, last_seen): p for p in plans}
         for future in as_completed(futures):
             try:
-                future.result()
+                outcome = future.result()
             except Exception as e:
-                logging.error(f"Unhandled error processing client: {e}")
+                logging.error(f"Unhandled error processing {futures[future]['mac']}: {e}")
+                outcome = "error"
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
 
-    logging.info("Sync complete.")
+    no_name = sum(1 for p in plans if not p["hostname"])
+    logging.info(f"Result: {dict(sorted(outcomes.items()))}; {no_name} of {len(plans)} without a forward name.")
+    if outcomes.get("error"):
+        logging.error(f"{outcomes['error']} client(s) failed.")
+        return 1
+    logging.info("Dry run complete." if args.dryrun else "Sync complete.")
+    return 0
 
 
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Sync UniFi clients to phpIPAM.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -605,117 +736,60 @@ if __name__ == "__main__":
             "  environment variables\n"
             "  CLI flags\n\n"
             "Required env vars:  UNIFI_API_KEY, IPAM_API_KEY\n"
-            "Optional env vars:  UNIFI_URL, IPAM_BASE_URL, IPAM_APP_ID"
+            "Optional env vars:  UNIFI_URL, IPAM_BASE_URL, IPAM_APP_ID, UNIFI_LEGACY_URL,\n"
+            "                    UNIFI_SITE_NAME, DNS_ZONE"
         ),
     )
 
     # Operational flags
-    parser.add_argument(
-        "--nuke-and-pave",
-        action="store_true",
-        help="Delete all addresses in IPAM before paving with UniFi clients.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=1000,
-        help="Maximum number of clients to fetch from UniFi (default: 1000).",
-    )
-    parser.add_argument(
-        "--site-id",
-        type=str,
-        default=None,
-        metavar="ID",
-        help="UniFi site ID to use. If omitted, available sites are listed for selection.",
-    )
-    parser.add_argument(
-        "--dryrun",
-        action="store_true",
-        help="Preview what would be synced without making any changes to phpIPAM.",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=4,
-        help="Number of parallel workers for client processing (default: 4).",
-    )
+    parser.add_argument("--limit", type=int, default=1000,
+                        help="Maximum number of clients to fetch from UniFi (default: 1000).")
+    parser.add_argument("--site-id", type=str, default=None, metavar="ID",
+                        help="UniFi site ID to use. If omitted, available sites are listed for selection.")
+    parser.add_argument("--dryrun", action="store_true",
+                        help="Read UniFi and phpIPAM and print what would change; write nothing.")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Number of parallel workers for client processing (default: 4).")
+    parser.add_argument("--dns-zone", type=str, default=None, metavar="ZONE",
+                        help="Zone of the Default network (e.g. home.8none1.com). A Local DNS Record in this "
+                             "zone is stored without it. Overrides DNS_ZONE and config dns.zone. "
+                             "Without a zone, Local DNS Records are not used.")
+    parser.add_argument("--unifi-site-name", type=str, default=None, metavar="NAME",
+                        help="Site name for the classic UniFi API (default: default).")
 
     # Configuration sources
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        metavar="PATH",
-        help=f"Path to YAML config file (default: {DEFAULT_CONFIG_PATH}).",
-    )
-    parser.add_argument(
-        "--unifi-url",
-        type=str,
-        default=None,
-        metavar="URL",
-        help="UniFi controller base URL. Overrides UNIFI_URL env var and config file.",
-    )
-    parser.add_argument(
-        "--ipam-base-url",
-        type=str,
-        default=None,
-        metavar="URL",
-        help="phpIPAM base URL. Overrides IPAM_BASE_URL env var and config file.",
-    )
-    parser.add_argument(
-        "--ipam-app-id",
-        type=str,
-        default=None,
-        metavar="ID",
-        help="phpIPAM application ID. Overrides IPAM_APP_ID env var and config file.",
-    )
-    parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help="Disable SSL certificate verification. Use for self-signed certificates.",
-    )
-    parser.add_argument(
-        "--include-subnet",
-        action="append",
-        default=[],
-        metavar="CIDR",
-        help="Only process clients whose IP falls within this subnet. "
-             "May be repeated. Mutually exclusive with --exclude-subnet.",
-    )
-    parser.add_argument(
-        "--exclude-subnet",
-        action="append",
-        default=[],
-        metavar="CIDR",
-        help="Skip clients whose IP falls within this subnet. "
-             "May be repeated. Mutually exclusive with --include-subnet.",
-    )
+    parser.add_argument("--config", type=str, default=None, metavar="PATH",
+                        help=f"Path to YAML config file (default: {DEFAULT_CONFIG_PATH}).")
+    parser.add_argument("--unifi-url", type=str, default=None, metavar="URL",
+                        help="UniFi controller base URL. Overrides UNIFI_URL env var and config file.")
+    parser.add_argument("--ipam-base-url", type=str, default=None, metavar="URL",
+                        help="phpIPAM base URL. Overrides IPAM_BASE_URL env var and config file.")
+    parser.add_argument("--ipam-app-id", type=str, default=None, metavar="ID",
+                        help="phpIPAM application ID. Overrides IPAM_APP_ID env var and config file.")
+    parser.add_argument("--insecure", action="store_true",
+                        help="Disable SSL certificate verification. Use for self-signed certificates.")
+    parser.add_argument("--include-subnet", action="append", default=[], metavar="CIDR",
+                        help="Only process clients whose IP falls within this subnet. "
+                             "May be repeated. Mutually exclusive with --exclude-subnet.")
+    parser.add_argument("--exclude-subnet", action="append", default=[], metavar="CIDR",
+                        help="Skip clients whose IP falls within this subnet. "
+                             "May be repeated. Mutually exclusive with --include-subnet.")
 
     # Logging flags
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable debug-level output.",
-    )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress all output except errors.",
-    )
-    parser.add_argument(
-        "--log-file",
-        type=str,
-        default=None,
-        metavar="PATH",
-        help="Write log output to this file in addition to stdout.",
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version="unifi2ipam v1.1.0",
-    )
+    parser.add_argument("--verbose", action="store_true", help="Enable debug-level output.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress all output except errors.")
+    parser.add_argument("--log-file", type=str, default=None, metavar="PATH",
+                        help="Write log output to this file in addition to stdout.")
+    parser.add_argument("--version", action="version", version=f"unifi2ipam v{__version__}")
+    return parser
 
-    args = parser.parse_args()
+
+def cli(argv=None) -> int:
+    args = build_parser().parse_args(argv)
     setup_logging(args)
     cfg = load_config(args)
-    main(cfg, args)
+    return main(cfg, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())
